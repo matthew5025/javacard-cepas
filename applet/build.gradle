@@ -17,6 +17,7 @@ buildscript {
 
 apply plugin: 'com.klinec.gradle.javacard'
 apply plugin: 'idea'
+apply plugin: 'java'
 sourceCompatibility = 1.8
 
 // Common settings, definitions
@@ -43,6 +44,11 @@ repositories {
 // Dependencies for your project
 dependencies {
     jcardsim 'com.klinec:jcardsim:3.0.5.11'
+
+    implementation 'com.github.martinpaljak:apdu4j-core:2020b1'
+    implementation 'com.github.martinpaljak:apdu4j-pcsc:20.08.12'
+    implementation 'com.github.martinpaljak:apdu4j-jnasmartcardio:0.2.7+191107'
+    implementation 'net.java.dev.jna:jna:5.13.0'
 
     testImplementation 'org.testng:testng:6.1.1'
     testImplementation 'org.slf4j:slf4j-api:1.7.2'
@@ -122,7 +128,7 @@ javacard {
         cap {
             packageName 'applet'
             version '0.1'
-            aid 'A0:00:00:03:41:00'
+            aid 'A0:00:00:03:41:00:01'
             output 'applet.cap'
 
             // JC310b43 supports compilation targeting for lower API versions.
@@ -147,4 +153,3 @@ javacard {
         }
     }
 }
-
