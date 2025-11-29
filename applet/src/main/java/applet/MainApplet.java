@@ -6,14 +6,23 @@ import javacard.security.RandomData;
 public class MainApplet extends Applet implements MultiSelectable {
     private static final byte CLA_PROPRIETARY = (byte) 0x90;
     private static final byte INS_RANDOM = (byte) 0x00;
+    private static final byte INS_GET_CHALLENGE = (byte) 0x84;
     private static final byte INS_CUSTOMIZATION = (byte) 0xF0;
     private static final byte INS_GET_PURSE_INFO = (byte) 0x32;
+    private static final byte INS_READ_BINARY = (byte) 0xB0;
+    private static final byte INS_FILE_WRITE = (byte) 0xF1;
+    private static final byte P2_WIPE_CHALLENGE = (byte) 0xFB;
+    private static final byte P2_WIPE_EXECUTE = (byte) 0xFC;
+    private static final byte P2_PURSE_RESET = (byte) 0xFA;
 
     private static final short BUFFER_SIZE = 256;
 
     private final byte[] tmpBuffer = JCSystem.makeTransientByteArray(BUFFER_SIZE, JCSystem.CLEAR_ON_DESELECT);
     private final RandomData random;
+    private final byte[] wipeNonce = new byte[4];
+    private byte wipeNonceValid = (byte) 0x00;
     private CEPAS cepas;
+    private final FileStore fileStore = new FileStore();
 
     public static void install(byte[] bArray, short bOffset, byte bLength) {
         new MainApplet(bArray, bOffset, bLength).register();
@@ -31,6 +40,7 @@ public class MainApplet extends Applet implements MultiSelectable {
     @Override
     public void deselect(boolean b) {
         // Nothing special on deselect
+        wipeNonceValid = (byte) 0x00;
     }
 
     @Override
@@ -109,6 +119,10 @@ public class MainApplet extends Applet implements MultiSelectable {
                 processGetPurseInfo(apdu, buffer, p1, incomingLength);
                 return;
 
+            case INS_FILE_WRITE:
+                processFileWrite(apdu, buffer, p1, p2, incomingLength);
+                return;
+
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
         }
@@ -134,7 +148,7 @@ public class MainApplet extends Applet implements MultiSelectable {
             if (p1 == 0x04) {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             }
-        } else if (cla == (byte) 0x00 && ins == (byte) 0x84) {
+        } else if (cla == (byte) 0x00 && ins == INS_GET_CHALLENGE) {
             // GET CHALLENGE or random-like
             byte [] response = {
                     (byte) 0x32, (byte) 0xa5, (byte) 0x83, (byte) 0x12,
@@ -142,6 +156,9 @@ public class MainApplet extends Applet implements MultiSelectable {
             };
             Util.arrayCopyNonAtomic(response, (short) 0, apduBuffer, (short) 0, (short) response.length);
             apdu.setOutgoingAndSend((short) 0, (short) response.length);
+            return;
+        } else if (cla == (byte) 0x00 && ins == INS_READ_BINARY) {
+            handleReadBinary(apdu, apduBuffer);
             return;
         }
         // If we get here, CLA is not recognized
@@ -185,6 +202,36 @@ public class MainApplet extends Applet implements MultiSelectable {
                 sendNoData(apdu);
                 return;
 
+            case P2_WIPE_CHALLENGE:
+                // Issue a one-time nonce required for wipe
+                random.generateData(wipeNonce, (short) 0, (short) wipeNonce.length);
+                wipeNonceValid = (byte) 0x01;
+                Util.arrayCopyNonAtomic(wipeNonce, (short) 0, apduBuffer, (short) 0, (short) wipeNonce.length);
+                apdu.setOutgoingAndSend((short) 0, (short) wipeNonce.length);
+                return;
+
+            case P2_WIPE_EXECUTE:
+                // Wipe (delete) purse slot, only with echoed nonce
+                if (dataLength != (short) wipeNonce.length || wipeNonceValid == (byte) 0x00) {
+                    ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+                }
+                for (short i = 0; i < wipeNonce.length; i++) {
+                    if (apduBuffer[(short) (5 + i)] != wipeNonce[i]) {
+                        ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+                    }
+                }
+                wipeNonceValid = (byte) 0x00;
+                cepas.deletePurse((byte) p1);
+                sendNoData(apdu);
+                return;
+
+            case P2_PURSE_RESET:
+                // Clear existing purse back to defaults (keeps slot present)
+                ensurePurseExists(p1);
+                cepas.resetPurse((byte) p1);
+                sendNoData(apdu);
+                return;
+
             case (byte) 0xFD:
                 // One-way lock to prevent further customization edits
                 ensurePurseExists(p1);
@@ -216,6 +263,7 @@ public class MainApplet extends Applet implements MultiSelectable {
                 Util.arrayCopyNonAtomic(apduBuffer, (short) 47, cepas.purses[p1].last_trn_trp,   (short) 0, (short) 4);
                 Util.arrayCopyNonAtomic(apduBuffer, (short) 51, cepas.purses[p1].last_trn_rec,   (short) 0, (short) 16);
                 Util.arrayCopyNonAtomic(apduBuffer, (short) 67, cepas.purses[p1].issuer_data,    (short) 0, (short) 32);
+                cepas.purses[p1].tail_byte = apduBuffer[99];
                 // Reset logs; personalization image does not include them
                 cepas.purses[p1].clearLogs();
                 cepas.purses[p1].lock(); // Lock immediately after full personalization copy
@@ -375,10 +423,14 @@ public class MainApplet extends Applet implements MultiSelectable {
         } else if (dataLength == 1) {
             // Return transaction data
             short offset = apduBuffer[5]; // single byte
-            // Case 3: no Le supplied, default to 1 record (16 bytes).
+            // If no Le is present, throw 6700 to mirror observed behavior; Le=0 means 256.
             short le = apdu.setOutgoing();
             if (le == 0) {
-                le = 16;
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            }
+            if (le == 256) {
+                // explicit Le=0 maps to 256 bytes
+                le = 256;
             }
             short numRecs = (short) (((short) (le + 16 - 1)) / 16);
             cepas.purses[p1].getTransaction(offset, numRecs, apdu.getBuffer());
@@ -388,6 +440,70 @@ public class MainApplet extends Applet implements MultiSelectable {
 
         } else {
             ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
+    }
+
+    /**
+     * Proprietary file write: CLA=0x90, INS=0xF1
+     * P1 = SFI (1-30)
+     * P2 = flags (bit0 set => flip auth flag, bit1 value of auth flag)
+     * Data = [offset (1 byte)] + payload bytes (0..length)
+     * - offset+len must not exceed file length, else 6A82
+     * - Persisted in EEPROM-backed array
+     */
+    private void processFileWrite(APDU apdu, byte[] apduBuffer, short p1, short p2, short incomingLength) {
+        short dataLen = incomingLength;
+        if (dataLen == 0) {
+            dataLen = (short) (apduBuffer[ISO7816.OFFSET_LC] & 0xFF);
+        }
+        // P2 sub-ops:
+        // 0x00: WRITE payload (data: offset + bytes)
+        // 0x01: CREATE (data: len_hi, len_lo, authFlag, [initial payload])
+        // 0x02: DELETE (no data)
+        // 0x03: SET_AUTH (data: authFlag byte)
+        // 0x10: LIST (no data; returns entries)
+        switch ((byte) p2) {
+            case (byte) 0x00: // WRITE
+                if (dataLen < 1) {
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+                }
+                fileStore.writeFile((byte) p1, (byte) p2, apduBuffer, (short) 5, dataLen);
+                sendNoData(apdu);
+                return;
+            case (byte) 0x01: { // CREATE
+                if (dataLen < 3) {
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+                }
+                short len = Util.getShort(apduBuffer, (short) 5);
+                boolean auth = apduBuffer[7] != 0;
+                fileStore.createFile((byte) p1, len, auth);
+                short payloadLen = (short) (dataLen - 3);
+                if (payloadLen > 0) {
+                    // reuse write for initial payload at offset 0
+                    apduBuffer[5] = 0x00; // offset zero for writeFile
+                    fileStore.writeFile((byte) p1, (byte) 0x00, apduBuffer, (short) 5, (short) (payloadLen + 1));
+                }
+                sendNoData(apdu);
+                return;
+            }
+            case (byte) 0x02: // DELETE
+                fileStore.deleteFile((byte) p1);
+                sendNoData(apdu);
+                return;
+            case (byte) 0x03: // SET_AUTH
+                if (dataLen < 1) {
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+                }
+                fileStore.setAuth((byte) p1, apduBuffer[5] != 0);
+                sendNoData(apdu);
+                return;
+            case (byte) 0x10: { // LIST
+                short outLen = fileStore.listFiles(apduBuffer, (short) 0);
+                apdu.setOutgoingAndSend((short) 0, outLen);
+                return;
+            }
+            default:
+                ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         }
     }
 
@@ -414,6 +530,19 @@ public class MainApplet extends Applet implements MultiSelectable {
 
     private void sendNoData(APDU apdu) {
         apdu.setOutgoingAndSend((short) 0, (short) 0);
+    }
+
+    /**
+     * Initialise the synthetic file store that backs READ BINARY by SFI.
+     * No hard-coded payloads: fillers generate deterministic bytes from state.
+     */
+    // FileStore now starts empty; files are provisioned via proprietary commands.
+
+    /**
+     * Handle READ BINARY by SFI (CLA=0x00, INS=0xB0) in alignment with observed card behaviour.
+     */
+    private void handleReadBinary(APDU apdu, byte[] apduBuffer) {
+        fileStore.readBySfi(new FileStore.APDUContext(apdu, apduBuffer));
     }
 
 }

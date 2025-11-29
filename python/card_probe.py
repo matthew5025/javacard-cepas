@@ -19,13 +19,9 @@ Usage examples:
 import argparse
 import sys
 from typing import Iterable, List, Tuple
-
-try:
-    from smartcard.System import readers
-    from smartcard.CardConnection import CardConnection
-    from smartcard.Exceptions import NoReadersException, NoCardException
-except ImportError:  # pragma: no cover - runtime guard for missing dependency
-    sys.exit("pyscard is required. Install with: pip install pyscard")
+from smartcard.System import readers
+from smartcard.CardConnection import CardConnection
+from smartcard.Exceptions import NoReadersException, NoCardException
 
 
 APP_AID: List[int] = [0xA0, 0x00, 0x00, 0x03, 0x41, 0x00, 0x01, 0x01]
@@ -35,6 +31,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Probe CEPAS applet on a PC/SC reader.")
     parser.add_argument("--reader", help="substring to choose a specific reader (defaults to first available)")
     parser.add_argument("--purse", type=int, default=0, help="purse index to exercise (default: 0)")
+parser.add_argument("--sfis", default="1-30", help="SFI ranges to read (e.g. '1-5,8,12'). Use 'none' to skip")
+parser.add_argument("--fids", default="0003,0010,0012,0013,0014,0016,0017,0018,0090", help="Comma-separated hex FIDs to read under DF 4000. Use 'none' to skip")
+parser.add_argument("--list-files", action="store_true", help="Call proprietary LIST (90 F1 P2=10) after selecting applet")
+    parser.add_argument("--wipe", action="store_true", help="After probing, issue wipe challenge+execute for the selected purse index")
     return parser.parse_args()
 
 
@@ -72,6 +72,25 @@ def pick_reader_with_card(preferred: str):
     if preferred:
         sys.exit(f"Reader '{preferred}' found but no card is present or connectable: {last_error}")
     sys.exit(f"No readers had a present/usable card. Last error: {last_error}")
+
+
+def parse_int_list(spec: str, base: int = 10, allow_ranges: bool = False) -> List[int]:
+    if spec.lower() == "none":
+        return []
+    parts = spec.split(',')
+    out: List[int] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if allow_ranges and '-' in p:
+            lo_str, hi_str = p.split('-', 1)
+            lo = int(lo_str, base)
+            hi = int(hi_str, base)
+            out.extend(range(lo, hi + 1))
+        else:
+            out.append(int(p, base))
+    return out
 
 
 def send(conn: CardConnection, apdu: Iterable[int], label: str) -> Tuple[int, List[int]]:
@@ -143,6 +162,69 @@ def decode_purse_info(data: List[int]) -> Tuple[int, int]:
     return log_count, issuer_len
 
 
+def read_sfis(conn: CardConnection, sfi_list: List[int]):
+    if not sfi_list:
+        return
+    print(f"\nReading short EF files by SFI: {sfi_list}")
+    for sfi in sfi_list:
+        sfi &= 0x1F
+        p1 = 0x80 | sfi
+        apdu = [0x00, 0xB0, p1, 0x00, 0x00]
+        sw, data = send(conn, apdu, f"READ BINARY SFI={sfi:02d}")
+        preview = to_hex(data[:32])
+        print(f"  SFI {sfi:02d}: SW={sw:04X} len={len(data)} data[0:16]={preview}")
+
+
+def read_fids(conn: CardConnection, fid_list: List[int]):
+    if not fid_list:
+        return
+    print(f"\nReading EF files under DF 4000 by FID: {[f'0x{x:04X}' for x in fid_list]}")
+
+    # SELECT DF 4000 once; ignore failure (card may not have it)
+    df_apdu = [0x00, 0xA4, 0x00, 0x00, 0x02, 0x40, 0x00]
+    sw, _ = send(conn, df_apdu, "SELECT DF 4000")
+    if sw != 0x9000:
+        print("  DF 4000 not present or not accessible; skipping FID reads.")
+        return
+
+    for fid in fid_list:
+        fid_hi, fid_lo = (fid >> 8) & 0xFF, fid & 0xFF
+        sel = [0x00, 0xA4, 0x00, 0x0C, 0x02, fid_hi, fid_lo]
+        sw_sel, _ = send(conn, sel, f"SELECT FID 0x{fid:04X}")
+        if sw_sel != 0x9000:
+            continue
+
+        offset = 0
+        full = []
+        while offset < 4096:  # safety limit
+            p1 = offset >> 8
+            p2 = offset & 0xFF
+            apdu = [0x00, 0xB0, p1 & 0x7F, p2, 0x00]
+            sw_read, chunk = send(conn, apdu, f"READ FID 0x{fid:04X} off=0x{offset:04X}")
+            full.extend(chunk)
+            if sw_read == 0x9000 and len(chunk) == 256:
+                offset += 256
+                continue
+            break
+
+        preview = to_hex(full[:32])
+        print(f"  FID 0x{fid:04X}: SW={sw_read:04X} len={len(full)} data[0:16]={preview}")
+
+
+def list_files(conn: CardConnection):
+    apdu = [0x90, 0xF1, 0x00, 0x10, 0x00]
+    sw, data = send(conn, apdu, "LIST FILES")
+    if sw != 0x9000:
+        return
+    print("  entries: sfi len auth")
+    for i in range(0, len(data), 4):
+        if i + 3 >= len(data):
+            break
+        sfi, lhi, llo, auth = data[i], data[i+1], data[i+2], data[i+3]
+        length = (lhi << 8) | llo
+        print(f"  {sfi:02d}   {length:04d}  {auth}")
+
+
 def read_logs(conn: CardConnection, p1: int, log_count: int) -> None:
     if log_count == 0:
         print("\nNo transaction logs present.")
@@ -181,6 +263,12 @@ def main() -> None:
     args = parse_args()
     reader, conn = pick_reader_with_card(args.reader)
     print(f"Using reader: {reader.name}")
+    sfi_targets = parse_int_list(args.sfis, base=10, allow_ranges=True)
+    fid_targets = parse_int_list(args.fids, base=16, allow_ranges=False)
+
+    if args.list_files:
+        send(conn, [0x00, 0xA4, 0x04, 0x00, len(APP_AID)] + APP_AID, "SELECT AID")
+        list_files(conn)
 
     # Explicit SELECT is intentionally skipped per request; assume card powers up in the correct DF.
     purse = args.purse & 0xFF
@@ -249,10 +337,32 @@ def main() -> None:
     # Read transaction log records if present
     read_logs(conn, p1_used, log_count)
 
+    # Optional EF scraping similar to iOS reader
+    read_sfis(conn, sfi_targets)
+    read_fids(conn, fid_targets)
+
+    if args.wipe:
+        wipe_purse(conn, args.purse)
+
     try:
         conn.disconnect()
     except Exception:
         pass
+
+
+def wipe_purse(conn: CardConnection, purse_index: int) -> None:
+    print(f"\nWiping purse {purse_index} via challenge-response …")
+    # Challenge
+    sw, nonce = send(conn, [0x90, 0xF0, purse_index & 0xFF, 0xFB], "Wipe challenge")
+    if sw != 0x9000 or len(nonce) != 4:
+        print(f"  Wipe challenge failed (SW={sw:04X}, len={len(nonce)})")
+        return
+    # Execute with echoed nonce
+    sw_exec, _ = send(conn, [0x90, 0xF0, purse_index & 0xFF, 0xFC, 0x04] + nonce, "Wipe execute")
+    if sw_exec == 0x9000:
+        print("  Wipe succeeded (purse slot cleared).")
+    else:
+        print(f"  Wipe failed (SW={sw_exec:04X}).")
 
 
 if __name__ == "__main__":

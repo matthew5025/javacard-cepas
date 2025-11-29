@@ -13,6 +13,22 @@ public class CEPAS {
 
         this.purses[pursePosition] = new CEPASPurse();
     }
+
+    void deletePurse(short pursePosition) {
+        if (pursePosition > 4) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+            return;
+        }
+        this.purses[pursePosition] = null;
+    }
+
+    void resetPurse(short pursePosition) {
+        if (pursePosition > 4) {
+            ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+            return;
+        }
+        this.purses[pursePosition] = new CEPASPurse();
+    }
 }
 
 class CEPASPurse {
@@ -34,6 +50,7 @@ class CEPASPurse {
     byte[] last_trn_trp = new byte[4];
     byte[] last_trn_rec = new byte[16];
     byte[] issuer_data;
+    byte tail_byte = (byte) 0x00; // extra trailing byte observed in real dumps
 
     // We store up to max_trn_rec_len logs
     CEPASTransactionLog[] transaction_logs = new CEPASTransactionLog[MAX_TRN_REC_LEN];
@@ -144,7 +161,8 @@ class CEPASPurse {
         Util.arrayCopyNonAtomic(this.last_trn_trp, (short)0 , responseBuffer, (short)42, (short)4);
         Util.arrayCopyNonAtomic(this.last_trn_rec, (short)0 , responseBuffer, (short)46, (short)16);
         Util.arrayCopyNonAtomic(this.issuer_data, (short)0 , responseBuffer, (short)62, this.issuer_data_len);
-        return (short) (62 + this.issuer_data_len);
+        responseBuffer[(short)(62 + this.issuer_data_len)] = this.tail_byte;
+        return (short) (63 + this.issuer_data_len);
     }
 
 
